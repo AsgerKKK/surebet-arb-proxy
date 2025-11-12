@@ -183,6 +183,5 @@ function findArbs(groups){
 }
 
 // ---------- start ----------
-app.listen(PORT, '0.0.0.0', () => {
+app.listen(PORT, '0.0.0.0', ()=>console.log(`Surebet arb server on ${PORT}`));
   console.log(`Surebet arb server on ${PORT}`);
-});
