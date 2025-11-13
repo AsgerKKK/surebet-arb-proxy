@@ -41,9 +41,17 @@ const prettyMarket = (x) => {
 const normalizeLine = o => [o.selection_line ?? '', o.player_id ? String(o.player_id) : ''].filter(Boolean).join(':');
 const groupKey = (fix, odd) => [fix.id, String(odd.market||'').toLowerCase(), normalizeLine(odd)].join('::');
 
+const isUpcoming = (row) => {
+  if (!row?.start_date) return false;
+  const t = Date.parse(row.start_date);
+  if (!isFinite(t)) return false;
+  return t >= Date.now();
+};
+
 /* -------- fixtures direkte pr. sport (med odds) --------
    - is_live: 0/1
    - max: cap på hvor mange fixtures du vil returnere
+   Filtrerer: live eller (kommende && !completed)
 -------------------------------------------------------- */
 async function listFixturesWithOddsBySport(sport, is_live = false, max = 120) {
   const out = [];
@@ -56,7 +64,9 @@ async function listFixturesWithOddsBySport(sport, is_live = false, max = 120) {
       limit: 50,
       page
     });
-    const rows = fx.data || [];
+    let rows = fx.data || [];
+    // hold kun live, ellers kommende (ikke completed)
+    rows = rows.filter(r => is_live ? r.is_live === true : (r.status !== 'completed' && isUpcoming(r)));
     out.push(...rows);
     if (!rows.length || (fx.total_pages && page >= fx.total_pages)) break;
     page++;
@@ -78,7 +88,7 @@ async function listFixturesWithOddsByLeagues(leagueIds, is_live = false, max = 1
         limit: 50,
         page
       });
-      const rows = fx.data || [];
+      let rows = (fx.data || []).filter(r => is_live ? r.is_live === true : (r.status !== 'completed' && isUpcoming(r)));
       out.push(...rows);
       if (!rows.length || (fx.total_pages && page >= fx.total_pages)) break;
       page++;
@@ -87,28 +97,62 @@ async function listFixturesWithOddsByLeagues(leagueIds, is_live = false, max = 1
   return out.slice(0, max);
 }
 
+/* -------- fixtures i et tidsvindue (kommende N timer) -- */
+async function listFixturesWindowBySport(sport, hoursAhead = 12, max = 200) {
+  const out = [];
+  let page = 1;
+  const now = Date.now();
+  const until = now + Math.max(1, hoursAhead)*3600*1000;
+  while (out.length < max) {
+    const fx = await oo('fixtures', {
+      sport,
+      has_odds: true,
+      is_live: false,
+      limit: 50,
+      page
+    });
+    let rows = fx.data || [];
+    rows = rows.filter(r => r.status !== 'completed' && isUpcoming(r) && Date.parse(r.start_date) <= until);
+    out.push(...rows);
+    if (!rows.length || (fx.total_pages && page >= fx.total_pages)) break;
+    page++;
+  }
+  return out.slice(0, max);
+}
+
 /* ----------------------- health/debug ----------------------- */
 app.get('/',       (_req, res) => res.status(200).send('surebet-proxy up'));
 app.get('/healthz',(_req, res) => res.status(200).send('ok'));
 
+// OBS: Kan godt ramme "random" liga – brug de andre debug-ruter nedenfor i stedet.
 app.get('/debug/fixtures', async (req,res) => {
   try {
     const sport = String(req.query.sport || 'soccer');
     const leagues = (await oo('leagues', { sport })).data || [];
     const leagueId = leagues[0]?.id;
     if (!leagueId) return res.json({ sport, leagues: leagues.length, fixtures: [] });
-    // NB: dette viser side 1 i en vilkårlig liga (kan godt være uden odds)
     const fx = await oo('fixtures', { league: leagueId, has_odds:true, limit:50, page:1 });
     res.json({ sport, league: leagueId, fixtures: (fx.data||[]).slice(0,10) });
   } catch(e){ res.status(500).json({ error: String(e.message||e) }); }
 });
 
+// LIVE (eller kommende) fixtures med odds – filtreret for ikke-completed
 app.get('/debug/fixtures_by_sport', async (req,res) => {
   try {
     const sport = String(req.query.sport || 'soccer');
     const is_live = String(req.query.is_live||'0') === '1';
     const rows  = await listFixturesWithOddsBySport(sport, is_live, 60);
     res.json({ sport, is_live, count: rows.length, sample: rows.slice(0, 10) });
+  } catch(e){ res.status(500).json({ error: String(e.message||e) }); }
+});
+
+// Kommende vindue (N timer frem) med odds
+app.get('/debug/fixtures_window', async (req,res) => {
+  try {
+    const sport = String(req.query.sport || 'soccer');
+    const hours = parseInt(req.query.hours || '12', 10);
+    const rows  = await listFixturesWindowBySport(sport, hours, 120);
+    res.json({ sport, hours, count: rows.length, sample: rows.slice(0, 15) });
   } catch(e){ res.status(500).json({ error: String(e.message||e) }); }
 });
 
@@ -149,20 +193,22 @@ app.get('/debug/odds', async (req,res) => {
 /* ----------------------- main: /arb -----------------------
    Parametre:
    - sports=... (comma)    fx soccer,basketball,hockey
-   - is_live=0|1           default 0
+   - is_live=0|1           default 0 (brug 1 for live – flere overlap)
    - leagues=... (comma)   valgfrit: hvis sat, hentes fixtures fra disse leagues først
-   - max_leagues=8         cap
-   - max_fixtures=300      cap
-   - limit=150             antal arbs retur
+   - window_hours=N        valgfrit: kommende N timer (ignoreres hvis is_live=1)
+   - max_leagues=8
+   - max_fixtures=300
+   - limit=150
    - min_edge=0
    - debug=1               returnerer groups-overblik i stedet for arbs
 ----------------------------------------------------------- */
 app.get('/arb', async (req, res) => {
   const limit        = Math.min(parseInt(req.query.limit || '150', 10), 500);
   const minEdge      = parseFloat(req.query.min_edge || '0');
-  const sportsParam  = String(req.query.sports || req.query.sport || 'soccer,basketball,tennis,hockey,handball');
+  const sportsParam  = String(req.query.sports || req.query.sport || 'basketball,tennis,hockey,soccer');
   const sportsList   = sportsParam.split(',').map(s=>s.trim()).filter(Boolean);
   const is_live      = String(req.query.is_live||'0') === '1';
+  const windowHours  = parseInt(req.query.window_hours || '12', 10);
   const MAX_LEAGUES  = Math.min(parseInt(req.query.max_leagues  || '8', 10), 50);
   const MAX_FIXTURES = Math.min(parseInt(req.query.max_fixtures || '300', 10), 1000);
   const debugMode    = String(req.query.debug||'').toLowerCase()==='1';
@@ -172,14 +218,16 @@ app.get('/arb', async (req, res) => {
   const leagueIds    = leaguesParam ? leaguesParam.split(',').map(s=>s.trim()).filter(Boolean) : [];
 
   try {
-    // 1) saml fixtures (prioritér leagues hvis angivet)
+    // 1) saml fixtures
     let fixtures = [];
     if (leagueIds.length){
       fixtures = await withTimeout(sig => listFixturesWithOddsByLeagues(leagueIds, is_live, MAX_FIXTURES), 25000);
     }
     if (!fixtures.length){
       for (const s of sportsList){
-        const part = await withTimeout(sig => listFixturesWithOddsBySport(s, is_live, MAX_FIXTURES), 20000);
+        const part = is_live
+          ? await withTimeout(sig => listFixturesWithOddsBySport(s, true, MAX_FIXTURES), 20000)
+          : await withTimeout(sig => listFixturesWindowBySport(s, windowHours, MAX_FIXTURES), 20000);
         fixtures.push(...part);
         if (fixtures.length >= MAX_FIXTURES) break;
       }
