@@ -41,15 +41,18 @@ const prettyMarket = (x) => {
 const normalizeLine = o => [o.selection_line ?? '', o.player_id ? String(o.player_id) : ''].filter(Boolean).join(':');
 const groupKey = (fix, odd) => [fix.id, String(odd.market||'').toLowerCase(), normalizeLine(odd)].join('::');
 
-/* -------- fixtures direkte pr. sport (med odds) -------- */
-async function listFixturesWithOddsBySport(sport, max = 120) {
+/* -------- fixtures direkte pr. sport (med odds) --------
+   - is_live: 0/1
+   - max: cap på hvor mange fixtures du vil returnere
+-------------------------------------------------------- */
+async function listFixturesWithOddsBySport(sport, is_live = false, max = 120) {
   const out = [];
   let page = 1;
   while (out.length < max) {
     const fx = await oo('fixtures', {
       sport,
       has_odds: true,
-      is_live: false,
+      is_live: !!is_live,
       limit: 50,
       page
     });
@@ -57,6 +60,29 @@ async function listFixturesWithOddsBySport(sport, max = 120) {
     out.push(...rows);
     if (!rows.length || (fx.total_pages && page >= fx.total_pages)) break;
     page++;
+  }
+  return out.slice(0, max);
+}
+
+/* -------- fixtures per league (fallback / explicit) ---- */
+async function listFixturesWithOddsByLeagues(leagueIds, is_live = false, max = 120) {
+  const out = [];
+  for (const L of leagueIds) {
+    if (out.length >= max) break;
+    let page = 1;
+    while (out.length < max) {
+      const fx = await oo('fixtures', {
+        league: L,
+        has_odds: true,
+        is_live: !!is_live,
+        limit: 50,
+        page
+      });
+      const rows = fx.data || [];
+      out.push(...rows);
+      if (!rows.length || (fx.total_pages && page >= fx.total_pages)) break;
+      page++;
+    }
   }
   return out.slice(0, max);
 }
@@ -71,76 +97,97 @@ app.get('/debug/fixtures', async (req,res) => {
     const leagues = (await oo('leagues', { sport })).data || [];
     const leagueId = leagues[0]?.id;
     if (!leagueId) return res.json({ sport, leagues: leagues.length, fixtures: [] });
+    // NB: dette viser side 1 i en vilkårlig liga (kan godt være uden odds)
     const fx = await oo('fixtures', { league: leagueId, has_odds:true, limit:50, page:1 });
     res.json({ sport, league: leagueId, fixtures: (fx.data||[]).slice(0,10) });
-  } catch(e){ res.status(500).send(e.message); }
+  } catch(e){ res.status(500).json({ error: String(e.message||e) }); }
 });
 
 app.get('/debug/fixtures_by_sport', async (req,res) => {
   try {
     const sport = String(req.query.sport || 'soccer');
-    const rows  = await listFixturesWithOddsBySport(sport, 60);
-    res.json({ sport, count: rows.length, sample: rows.slice(0, 10) });
-  } catch(e){ res.status(500).send(e.message); }
+    const is_live = String(req.query.is_live||'0') === '1';
+    const rows  = await listFixturesWithOddsBySport(sport, is_live, 60);
+    res.json({ sport, is_live, count: rows.length, sample: rows.slice(0, 10) });
+  } catch(e){ res.status(500).json({ error: String(e.message||e) }); }
 });
 
+// Test odds for 1 fixture – prøver bøger en ad gangen og returnerer JSON altid
 app.get('/debug/odds', async (req,res) => {
   try {
     const fixture_id = req.query.fixture_id;
-    if (!fixture_id) return res.status(400).send('fixture_id required');
-    const books = (req.query.books || BOOKS.join(',')).split(',').map(s=>s.trim());
-    const js = await oo('fixtures/odds', {
-      fixture_id: [fixture_id],
-      sportsbook: books,
-      odds_format: 'DECIMAL',
-      include_deep_link: true
-    });
-    res.json(js);
-  } catch(e){ res.status(500).send(e.message); }
+    if (!fixture_id) return res.status(400).json({ error: 'fixture_id required' });
+
+    const books = (req.query.books || BOOKS.join(','))
+      .split(',').map(s=>s.trim()).filter(Boolean);
+
+    const results = [];
+    for (const b of books) {
+      try {
+        const js = await oo('fixtures/odds', {
+          fixture_id: [fixture_id],
+          sportsbook: [b],
+          odds_format: 'DECIMAL',
+          include_deep_link: true
+        });
+        results.push({
+          book: b,
+          status: 'ok',
+          count: js.data?.[0]?.odds?.length || 0,
+          sample: js.data?.[0]?.odds?.slice(0,3) || []
+        });
+      } catch (e) {
+        results.push({ book: b, status: 'error', error: String(e.message || e) });
+      }
+    }
+    res.json({ fixture_id, results });
+  } catch(e){
+    res.status(500).json({ error: String(e.message||e) });
+  }
 });
 
-/* ----------------------- main: /arb ----------------------- */
+/* ----------------------- main: /arb -----------------------
+   Parametre:
+   - sports=... (comma)    fx soccer,basketball,hockey
+   - is_live=0|1           default 0
+   - leagues=... (comma)   valgfrit: hvis sat, hentes fixtures fra disse leagues først
+   - max_leagues=8         cap
+   - max_fixtures=300      cap
+   - limit=150             antal arbs retur
+   - min_edge=0
+   - debug=1               returnerer groups-overblik i stedet for arbs
+----------------------------------------------------------- */
 app.get('/arb', async (req, res) => {
   const limit        = Math.min(parseInt(req.query.limit || '150', 10), 500);
   const minEdge      = parseFloat(req.query.min_edge || '0');
-  const onlySport    = (req.query.sport || '').toLowerCase();   // fx soccer
+  const sportsParam  = String(req.query.sports || req.query.sport || 'soccer,basketball,tennis,hockey,handball');
+  const sportsList   = sportsParam.split(',').map(s=>s.trim()).filter(Boolean);
+  const is_live      = String(req.query.is_live||'0') === '1';
   const MAX_LEAGUES  = Math.min(parseInt(req.query.max_leagues  || '8', 10), 50);
-  const MAX_FIXTURES = Math.min(parseInt(req.query.max_fixtures || '50', 10), 300);
+  const MAX_FIXTURES = Math.min(parseInt(req.query.max_fixtures || '300', 10), 1000);
   const debugMode    = String(req.query.debug||'').toLowerCase()==='1';
 
+  // specifikke leagues? (kommasepareret)
+  const leaguesParam = String(req.query.leagues || '').trim();
+  const leagueIds    = leaguesParam ? leaguesParam.split(',').map(s=>s.trim()).filter(Boolean) : [];
+
   try {
-    // 1) aktive sports (filtrer hvis sport=)
-    const sportsJs = await withTimeout(sig => oo('sports/active', {}, sig), 12000);
-    let sports = (sportsJs.data || []);
-    if (onlySport) sports = sports.filter(s => String(s.id||'').toLowerCase().includes(onlySport));
-    if (!sports.length) return res.json([]);
-
-    // 2) prøv først fixtures med odds direkte pr. sport (hurtigst)
+    // 1) saml fixtures (prioritér leagues hvis angivet)
     let fixtures = [];
-    for (const s of sports){
-      const part = await withTimeout(sig => listFixturesWithOddsBySport(s.id, MAX_FIXTURES), 15000);
-      fixtures.push(...part);
-      if (fixtures.length >= MAX_FIXTURES) break;
+    if (leagueIds.length){
+      fixtures = await withTimeout(sig => listFixturesWithOddsByLeagues(leagueIds, is_live, MAX_FIXTURES), 25000);
     }
-
-    // fallback via leagues hvis nødvendigt
-    if (!fixtures.length) {
-      const leagueIds = [];
-      for (const s of sports){
-        const leaguesJs = await withTimeout(sig => oo('leagues', { sport: s.id }, sig), 12000);
-        leagueIds.push(...(leaguesJs.data || []).slice(0, MAX_LEAGUES).map(l => l.id));
-      }
-      for (const L of leagueIds){
-        const fx = await withTimeout(sig => oo('fixtures', { league: L, has_odds: true, is_live: false, limit: 50, page: 1 }, sig), 15000);
-        fixtures.push(...(fx.data || []));
+    if (!fixtures.length){
+      for (const s of sportsList){
+        const part = await withTimeout(sig => listFixturesWithOddsBySport(s, is_live, MAX_FIXTURES), 20000);
+        fixtures.push(...part);
         if (fixtures.length >= MAX_FIXTURES) break;
       }
     }
-
     const fixtureIds = fixtures.slice(0, MAX_FIXTURES).map(f => f.id);
-    if (!fixtureIds.length) return res.json([]);
+    if (!fixtureIds.length) return res.json([]);  // intet at arbejde med
 
-    // 3) hent odds i batches (5 fixtures × 5 books)
+    // 2) hent odds i batches (5 fixtures × 5 books)
     const groups = new Map();
     const fixBatches  = chunk(fixtureIds, 5);
     const bookBatches = chunk(BOOKS, 5);
@@ -172,7 +219,7 @@ app.get('/arb', async (req, res) => {
       }
     }
 
-    // debug: vis hvilke grupper der har hvilke books
+    // 3) debug-overblik i stedet for arbs
     if (debugMode){
       const summary = [];
       for (const [k,g] of groups.entries()){
@@ -183,7 +230,7 @@ app.get('/arb', async (req, res) => {
         });
       }
       summary.sort((a,b)=>b.books.length - a.books.length);
-      return res.json({ groups: summary.slice(0, 30) });
+      return res.json({ groups: summary.slice(0, 50) });
     }
 
     // 4) find arbs (2-vejs + 3-vejs)
@@ -195,7 +242,7 @@ app.get('/arb', async (req, res) => {
     res.set('cache-control', 'no-store');
     res.json(rows);
   } catch (e) {
-    res.status(500).send(e.message || 'error');
+    res.status(500).json({ error: String(e.message || e) });
   }
 });
 
